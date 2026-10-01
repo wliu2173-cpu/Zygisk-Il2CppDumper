@@ -32,7 +32,12 @@ public:
 
     void postAppSpecialize(const AppSpecializeArgs *) override {
         if (enable_hack) {
-            std::thread hack_thread(hack_prepare, game_data_dir, data, length);
+            // 包装一层 lambda，先休眠 7 秒再执行 hack_prepare
+            auto wrapper = [=]() {
+                sleep(7);
+                hack_prepare(game_data_dir, data, length);
+            };
+            std::thread hack_thread(wrapper);
             hack_thread.detach();
         }
     }
@@ -40,10 +45,10 @@ public:
 private:
     Api *api;
     JNIEnv *env;
-    bool enable_hack;
-    char *game_data_dir;
-    void *data;
-    size_t length;
+    bool enable_hack = false;
+    char *game_data_dir = nullptr;
+    void *data = nullptr;
+    size_t length = 0;
 
     void preSpecialize(const char *package_name, const char *app_data_dir) {
         if (strcmp(package_name, GamePackageName) == 0) {
