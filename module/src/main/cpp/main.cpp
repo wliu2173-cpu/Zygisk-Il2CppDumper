@@ -99,12 +99,13 @@ public:
 
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         const char* pkg = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (strcmp(pkg, "com.papegames.lysk.cn") != 0) {
+        // 占位符，github action sed 自动替换
+        if (strcmp(pkg, "{{PACKAGE_NAME}}") != 0) {
             env->ReleaseStringUTFChars(args->nice_name, pkg);
             return;
         }
         env->ReleaseStringUTFChars(args->nice_name, pkg);
-        LOGI("=== 恋与深空进程, 初始化 Hook ===");
+        LOGI("=== 目标游戏进程, 初始化 Hook ===");
 
         extern void* dlsym(void* handle, const char* symbol);
         extern void* dlopen(const char* filename, int flag);
