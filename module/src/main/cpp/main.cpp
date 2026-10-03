@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <string>
+#include <cstring>
 #include <android/log.h>
 #include "zygisk.hpp"
 
@@ -15,8 +16,6 @@ typedef void* (*dlsym_t)(void* handle, const char* symbol);
 static dlsym_t orig_dlsym = nullptr;
 
 // ============ Hook EVP_DecryptInit_ex ============
-// int EVP_DecryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *type,
-//                        ENGINE *impl, const unsigned char *key, const unsigned char *iv);
 typedef int (*EVP_DecryptInit_ex_t)(void* ctx, void* type, void* impl,
                                      const unsigned char* key, const unsigned char* iv);
 static EVP_DecryptInit_ex_t orig_EVP_DecryptInit_ex = nullptr;
@@ -43,7 +42,6 @@ static int hook_EVP_DecryptInit_ex(void* ctx, void* type, void* impl,
     return orig_EVP_DecryptInit_ex(ctx, type, impl, key, iv);
 }
 
-// ============ 加载 libcrypto.so，hook EVP_DecryptInit_ex ============
 static void hookCrypto() {
     void* crypto = orig_dlopen("libcrypto.so", RTLD_NOW);
     if (crypto == nullptr) {
@@ -53,7 +51,6 @@ static void hookCrypto() {
 
     void* func = orig_dlsym(crypto, "EVP_DecryptInit_ex");
     if (func == nullptr) {
-        // 备选符号名
         func = orig_dlsym(crypto, "EVP_CipherInit_ex");
     }
     if (func == nullptr) {
@@ -62,8 +59,6 @@ static void hookCrypto() {
     }
 
     LOGI("EVP_DecryptInit_ex 地址: %p", func);
-
-    // 用 DobbyHook 挂载
     extern int DobbyHook(void* target, void* replace, void** orig);
     int ret = DobbyHook(func, (void*)hook_EVP_DecryptInit_ex, (void**)&orig_EVP_DecryptInit_ex);
     if (ret == 0) {
@@ -73,7 +68,6 @@ static void hookCrypto() {
     }
 }
 
-// ============ Hook dlopen，等 libAkSoundEngine.so 加载 ============
 static void* hook_dlopen(const char* filename, int flag) {
     void* handle = orig_dlopen(filename, flag);
     if (filename != nullptr && strstr(filename, "libAkSoundEngine.so")) {
@@ -83,7 +77,6 @@ static void* hook_dlopen(const char* filename, int flag) {
     return handle;
 }
 
-// ============ Hook dlsym ============
 static void* hook_dlsym(void* handle, const char* symbol) {
     void* addr = orig_dlsym(handle, symbol);
     if (symbol != nullptr && strcmp(symbol, "EVP_DecryptInit_ex") == 0) {
@@ -97,7 +90,6 @@ static void* hook_dlsym(void* handle, const char* symbol) {
     return addr;
 }
 
-// ============ Zygisk 模块入口 ============
 class MyModule : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api* api, JNIEnv* env) override {
@@ -114,17 +106,6 @@ public:
         env->ReleaseStringUTFChars(args->nice_name, pkg);
         LOGI("=== 恋与深空进程, 初始化 Hook ===");
 
-        // Hook dlopen
-        void* dlopen_addr = orig_dlsym == nullptr ? nullptr : orig_dlsym(RTLD_DEFAULT, "dlopen");
-        // 直接从 libc 拿
-        void* libc = orig_dlopen("shturl.", RTLD_NOW);
-        if (libc != nullptr) {
-            orig_dlsym = (dlsym_t)orig_dlopen("libdl.so", RTLD_NOW) != nullptr
-                         ? (dlsym_t)orig_dlsym(orig_dlopen("libdl.so", RTLD_NOW), "dlsym")
-                         : nullptr;
-        }
-
-        // 简化: 直接用 dlsym 系统调用
         extern void* dlsym(void* handle, const char* symbol);
         extern void* dlopen(const char* filename, int flag);
 
