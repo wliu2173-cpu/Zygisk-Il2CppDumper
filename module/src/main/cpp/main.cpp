@@ -1,85 +1,149 @@
-#include <cstring>
-#include <thread>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <cinttypes>
-#include "hack.h"
+#include <jni.h>
+#include <string>
+#include <android/log.h>
 #include "zygisk.hpp"
-#include "game.h"
-#include "log.h"
 
-using zygisk::Api;
-using zygisk::AppSpecializeArgs;
-using zygisk::ServerSpecializeArgs;
+#define LOG_TAG "WwiseKeyHook"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// ============ Dobby 函数指针声明 ============
+typedef void* (*dlopen_t)(const char* filename, int flag);
+static dlopen_t orig_dlopen = nullptr;
+
+typedef void* (*dlsym_t)(void* handle, const char* symbol);
+static dlsym_t orig_dlsym = nullptr;
+
+// ============ Hook EVP_DecryptInit_ex ============
+// int EVP_DecryptInit_ex(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *type,
+//                        ENGINE *impl, const unsigned char *key, const unsigned char *iv);
+typedef int (*EVP_DecryptInit_ex_t)(void* ctx, void* type, void* impl,
+                                     const unsigned char* key, const unsigned char* iv);
+static EVP_DecryptInit_ex_t orig_EVP_DecryptInit_ex = nullptr;
+
+static int hook_EVP_DecryptInit_ex(void* ctx, void* type, void* impl,
+                                    const unsigned char* key, const unsigned char* iv) {
+    if (key != nullptr) {
+        char key_hex[64] = {0};
+        for (int i = 0; i < 16; i++) {
+            sprintf(key_hex + i * 2, "%02x", key[i]);
+        }
+        LOGI("===== AES KEY FOUND =====");
+        LOGI("KEY: %s", key_hex);
+    }
+    if (iv != nullptr) {
+        char iv_hex[64] = {0};
+        for (int i = 0; i < 16; i++) {
+            sprintf(iv_hex + i * 2, "%02x", iv[i]);
+        }
+        LOGI("IV:  %s", iv_hex);
+    }
+    LOGI("=========================");
+
+    return orig_EVP_DecryptInit_ex(ctx, type, impl, key, iv);
+}
+
+// ============ 加载 libcrypto.so，hook EVP_DecryptInit_ex ============
+static void hookCrypto() {
+    void* crypto = orig_dlopen("libcrypto.so", RTLD_NOW);
+    if (crypto == nullptr) {
+        LOGE("libcrypto.so 加载失败");
+        return;
+    }
+
+    void* func = orig_dlsym(crypto, "EVP_DecryptInit_ex");
+    if (func == nullptr) {
+        // 备选符号名
+        func = orig_dlsym(crypto, "EVP_CipherInit_ex");
+    }
+    if (func == nullptr) {
+        LOGE("找不到 EVP_DecryptInit_ex");
+        return;
+    }
+
+    LOGI("EVP_DecryptInit_ex 地址: %p", func);
+
+    // 用 DobbyHook 挂载
+    extern int DobbyHook(void* target, void* replace, void** orig);
+    int ret = DobbyHook(func, (void*)hook_EVP_DecryptInit_ex, (void**)&orig_EVP_DecryptInit_ex);
+    if (ret == 0) {
+        LOGI("EVP_DecryptInit_ex Hook 成功!");
+    } else {
+        LOGE("DobbyHook 失败, ret=%d", ret);
+    }
+}
+
+// ============ Hook dlopen，等 libAkSoundEngine.so 加载 ============
+static void* hook_dlopen(const char* filename, int flag) {
+    void* handle = orig_dlopen(filename, flag);
+    if (filename != nullptr && strstr(filename, "libAkSoundEngine.so")) {
+        LOGI("libAkSoundEngine.so 已加载, 开始 Hook 加密函数");
+        hookCrypto();
+    }
+    return handle;
+}
+
+// ============ Hook dlsym ============
+static void* hook_dlsym(void* handle, const char* symbol) {
+    void* addr = orig_dlsym(handle, symbol);
+    if (symbol != nullptr && strcmp(symbol, "EVP_DecryptInit_ex") == 0) {
+        LOGI("dlsym 拿到 EVP_DecryptInit_ex = %p", addr);
+        if (orig_EVP_DecryptInit_ex == nullptr && addr != nullptr) {
+            extern int DobbyHook(void* target, void* replace, void** orig);
+            DobbyHook(addr, (void*)hook_EVP_DecryptInit_ex, (void**)&orig_EVP_DecryptInit_ex);
+            LOGI("通过 dlsym Hook 成功");
+        }
+    }
+    return addr;
+}
+
+// ============ Zygisk 模块入口 ============
 class MyModule : public zygisk::ModuleBase {
 public:
-    void onLoad(Api *api, JNIEnv *env) override {
+    void onLoad(zygisk::Api* api, JNIEnv* env) override {
         this->api = api;
         this->env = env;
     }
 
-    void preAppSpecialize(AppSpecializeArgs *args) override {
-        auto package_name = env->GetStringUTFChars(args->nice_name, nullptr);
-        auto app_data_dir = env->GetStringUTFChars(args->app_data_dir, nullptr);
-        preSpecialize(package_name, app_data_dir);
-        env->ReleaseStringUTFChars(args->nice_name, package_name);
-        env->ReleaseStringUTFChars(args->app_data_dir, app_data_dir);
-    }
+    void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
+        const char* pkg = env->GetStringUTFChars(args->nice_name, nullptr);
+        if (strcmp(pkg, "com.papegames.lysk.cn") != 0) {
+            env->ReleaseStringUTFChars(args->nice_name, pkg);
+            return;
+        }
+        env->ReleaseStringUTFChars(args->nice_name, pkg);
+        LOGI("=== 恋与深空进程, 初始化 Hook ===");
 
-    void postAppSpecialize(const AppSpecializeArgs *) override {
-        if (enable_hack) {
-            // 包装一层 lambda，先休眠 7 秒再执行 hack_prepare
-            auto wrapper = [=]() {
-                sleep(7);
-                hack_prepare(game_data_dir, data, length);
-            };
-            std::thread hack_thread(wrapper);
-            hack_thread.detach();
+        // Hook dlopen
+        void* dlopen_addr = orig_dlsym == nullptr ? nullptr : orig_dlsym(RTLD_DEFAULT, "dlopen");
+        // 直接从 libc 拿
+        void* libc = orig_dlopen("shturl.", RTLD_NOW);
+        if (libc != nullptr) {
+            orig_dlsym = (dlsym_t)orig_dlopen("libdl.so", RTLD_NOW) != nullptr
+                         ? (dlsym_t)orig_dlsym(orig_dlopen("libdl.so", RTLD_NOW), "dlsym")
+                         : nullptr;
+        }
+
+        // 简化: 直接用 dlsym 系统调用
+        extern void* dlsym(void* handle, const char* symbol);
+        extern void* dlopen(const char* filename, int flag);
+
+        void* dlopen_sym = dlsym(RTLD_DEFAULT, "dlopen");
+        void* dlsym_sym = dlsym(RTLD_DEFAULT, "dlsym");
+
+        if (dlopen_sym != nullptr && dlsym_sym != nullptr) {
+            extern int DobbyHook(void* target, void* replace, void** orig);
+            DobbyHook(dlopen_sym, (void*)hook_dlopen, (void**)&orig_dlopen);
+            DobbyHook(dlsym_sym, (void*)hook_dlsym, (void**)&orig_dlsym);
+            LOGI("dlopen/dlsym Hook 完成");
+        } else {
+            LOGE("找不到 dlopen/dlsym");
         }
     }
 
 private:
-    Api *api;
-    JNIEnv *env;
-    bool enable_hack = false;
-    char *game_data_dir = nullptr;
-    void *data = nullptr;
-    size_t length = 0;
-
-    void preSpecialize(const char *package_name, const char *app_data_dir) {
-        if (strcmp(package_name, GamePackageName) == 0) {
-            LOGI("detect game: %s", package_name);
-            enable_hack = true;
-            game_data_dir = new char[strlen(app_data_dir) + 1];
-            strcpy(game_data_dir, app_data_dir);
-
-#if defined(__i386__)
-            auto path = "zygisk/armeabi-v7a.so";
-#endif
-#if defined(__x86_64__)
-            auto path = "zygisk/arm64-v8a.so";
-#endif
-#if defined(__i386__) || defined(__x86_64__)
-            int dirfd = api->getModuleDir();
-            int fd = openat(dirfd, path, O_RDONLY);
-            if (fd != -1) {
-                struct stat sb{};
-                fstat(fd, &sb);
-                length = sb.st_size;
-                data = mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, 0);
-                close(fd);
-            } else {
-                LOGW("Unable to open arm file");
-            }
-#endif
-        } else {
-            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-        }
-    }
+    zygisk::Api* api = nullptr;
+    JNIEnv* env = nullptr;
 };
 
-REGISTER_ZYGISK_MODULE(MyModule)
+REGISTER_ZYGISK_MODULE(MyModule);
